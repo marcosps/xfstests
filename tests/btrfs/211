@@ -1,0 +1,153 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2020 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test 211
+#
+# Test if the file capabilities aren't lost after full and incremental send
+#
+seq=`basename $0`
+seqres=$RESULT_DIR/$seq
+echo "QA output created by $seq"
+
+here=`pwd`
+tmp=/tmp/$$
+status=1	# failure is the default!
+trap "_cleanup; exit \$status" 0 1 2 3 15
+
+# get standard environment, filters and checks
+. ./common/rc
+. ./common/filter
+
+# remove previous $seqres.full before test
+rm -f $seqres.full
+
+_supported_fs btrfs
+_supported_os Linux
+_require_scratch
+_require_command "$SETCAP_PROG" setcap
+_require_command "$GETCAP_PROG" getcap
+
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+}
+
+_check_xattr()
+{
+	local RET
+	local FILE
+	local CAP
+	FILE="$1"
+	CAP="$2"
+	RET=$($GETCAP_PROG "$FILE")
+	if [ -z "$RET" ]; then
+		echo "$RET"
+		_fail "missing capability in file $FILE"
+	fi
+	if [[ "$RET" != *$CAP* ]]; then
+		echo "$RET"
+		echo "$CAP"
+		_fail "Capability do not match. Output: $RET"
+	fi
+}
+
+_setup()
+{
+	_scratch_mkfs >/dev/null
+	_scratch_mount
+
+	FS1="$SCRATCH_MNT/fs1"
+	FS2="$SCRATCH_MNT/fs2"
+
+	$BTRFS_UTIL_PROG subvolume create "$FS1" > /dev/null
+	$BTRFS_UTIL_PROG subvolume create "$FS2" > /dev/null
+}
+
+_full_nocap_inc_withcap_send()
+{
+	_setup
+
+	# Test full send containing a file with no capability
+	touch "$FS1/foo.bar"
+	$BTRFS_UTIL_PROG subvolume snapshot -r "$FS1" "$FS1/snap_init" >/dev/null
+	$BTRFS_UTIL_PROG send "$FS1/snap_init" -q | $BTRFS_UTIL_PROG receive "$FS2" -q
+	# ensure that we don't have caps set
+	RET=$($GETCAP_PROG "$FS2/snap_init/foo.bar")
+	if [ -n "$RET" ]; then
+		_fail "File contain capabilities when it shouldn't"
+	fi
+
+	# Test if  incremental send bring the newly added capability
+	$SETCAP_PROG "cap_sys_ptrace+ep cap_sys_nice+ep" "$FS1/foo.bar"
+	$BTRFS_UTIL_PROG subvolume snapshot -r "$FS1" "$FS1/snap_inc" >/dev/null
+	$BTRFS_UTIL_PROG send -p "$FS1/snap_init" "$FS1/snap_inc" -q | \
+					$BTRFS_UTIL_PROG receive "$FS2" -q
+	_check_xattr "$FS2/snap_inc/foo.bar" "cap_sys_ptrace,cap_sys_nice+ep"
+
+	_scratch_unmount
+}
+
+_roundtrip_send()
+{
+	local FILES
+	local FS1
+	local FS2
+
+	# FILES should include foo.bar
+	FILES="$1"
+
+	_setup
+
+	# create files on fs1, must contain foo.bar
+	for f in $FILES; do
+		touch "$FS1/$f"
+	done
+
+	# Test full send, checking if the receiving side keeps the capability
+	$SETCAP_PROG "cap_sys_ptrace+ep cap_sys_nice+ep" "$FS1/foo.bar"
+	$BTRFS_UTIL_PROG subvolume snapshot -r "$FS1" "$FS1/snap_init" >/dev/null
+	$BTRFS_UTIL_PROG send "$FS1/snap_init" -q | $BTRFS_UTIL_PROG receive "$FS2" -q
+	_check_xattr "$FS2/snap_init/foo.bar" "cap_sys_ptrace,cap_sys_nice+ep"
+
+	# Test incremental send with different owner/group but same capability
+	chgrp 100 "$FS1/foo.bar"
+	$SETCAP_PROG "cap_sys_ptrace+ep cap_sys_nice+ep" "$FS1/foo.bar"
+	$BTRFS_UTIL_PROG subvolume snapshot -r "$FS1" "$FS1/snap_inc" >/dev/null
+	_check_xattr "$FS1/snap_inc/foo.bar" "cap_sys_ptrace,cap_sys_nice+ep"
+	$BTRFS_UTIL_PROG send -p "$FS1/snap_init" "$FS1/snap_inc" -q | \
+				$BTRFS_UTIL_PROG receive "$FS2" -q
+	_check_xattr "$FS2/snap_inc/foo.bar" "cap_sys_ptrace,cap_sys_nice+ep"
+
+	# Test capability after incremental send with different capability and group
+	chgrp 0 "$FS1/foo.bar"
+	$SETCAP_PROG "cap_sys_time+ep cap_syslog+ep" "$FS1/foo.bar"
+	$BTRFS_UTIL_PROG subvolume snapshot -r "$FS1" "$FS1/snap_inc2" >/dev/null
+	_check_xattr "$FS1/snap_inc2/foo.bar" "cap_sys_time,cap_syslog+ep"
+	$BTRFS_UTIL_PROG send -p "$FS1/snap_inc" "$FS1/snap_inc2" -q | \
+				$BTRFS_UTIL_PROG receive "$FS2"  -q
+	_check_xattr "$FS2/snap_inc2/foo.bar" "cap_sys_time,cap_syslog+ep"
+
+	_scratch_unmount
+}
+
+# real QA test starts here
+
+echo "Test full send + file without caps, then inc send bringing a new cap"
+_full_nocap_inc_withcap_send
+
+echo "Testing if foo.bar alone can keep it's capability"
+_roundtrip_send "foo.bar"
+
+echo "Test foo.bar being the first item among other files"
+_roundtrip_send "foo.bar foo.bax foo.baz"
+
+echo "Test foo.bar with objectid between two other files"
+_roundtrip_send "foo1 foo.bar foo3"
+
+echo "Test foo.bar being the last item among other files"
+_roundtrip_send "foo1 foo2 foo.bar"
+
+status=0
+exit
