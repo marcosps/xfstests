@@ -1,0 +1,194 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2020 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test 215
+#
+# Test mount options of btrfs
+# * space cache test already covered by test btrfs/131
+#
+seq=`basename $0`
+seqres=$RESULT_DIR/$seq
+echo "QA output created by $seq"
+
+here=`pwd`
+tmp=/tmp/$$
+status=1	# failure is the default!
+trap "cleanup; exit \$status" 0 1 2 3 15
+
+# get standard environment, filters and checks
+. ./common/rc
+. ./common/filter
+
+# remove previous $seqres.full before test
+rm -f $seqres.full
+
+_supported_fs btrfs
+_supported_os Linux
+_require_scratch
+
+cleanup()
+{
+	cd /
+	rm -f $tmp.*
+}
+
+test_mount_flags()
+{
+	local opt
+	local opt_check
+	opt="$1"
+	opt_check="$2"
+
+	active_opt=$(cat /proc/self/mounts | grep $SCRATCH_MNT | \
+					$AWK_PROG '{ print $4 }')
+	if [[ "$active_opt" != *$opt_check* ]]; then
+		echo "Could not find '$opt_check' in '$active_opt', using '$opt'"
+	fi
+}
+
+test_roundtrip_mount()
+{
+	local opt
+	local opt_check
+	local remount_opt
+	local remount_opt_check
+	opt="$1"
+	opt_check="$2"
+	remount_opt="$3"
+	remount_opt_check="$4"
+
+	_scratch_mount "-o $opt"
+
+	test_mount_flags $opt $opt_check
+
+	_scratch_remount $remount_opt
+
+	test_mount_flags $remount_opt $remount_opt_check
+
+	_scratch_remount $opt
+
+	test_mount_flags $opt $opt_check
+
+	_scratch_unmount
+}
+
+test_inverted_opts()
+{
+	local opt
+	local opt_check
+	local remount_opt
+	local remount_opt_check
+	opt="$1"
+	opt_check="$2"
+	remount_opt="$3"
+	remount_opt_check="$4"
+
+	# invert the args to make sure that both options work at mount and
+	# remount time
+	test_roundtrip_mount $opt $opt_check $remount_opt $remount_opt_check
+	test_roundtrip_mount $remount_opt $remount_opt_check $opt $opt_check
+}
+
+test_mount_opt()
+{
+	local opt
+	local opt_check
+	local active_opt
+	opt="$1"
+	opt_check="$2"
+
+	_scratch_mount "-o $opt"
+
+	test_mount_flags $opt $opt_check
+
+	_scratch_unmount
+}
+
+test_should_fail()
+{
+	local opt
+	opt="$1"
+
+	# wrong $opt on purpose, should fail
+	_try_scratch_mount "-o $opt" >/dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		return
+	fi
+	echo "Option $opt should fail to mount"
+	_scratch_unmount
+}
+
+# TODO: better naming?
+test_optional_opts()
+{
+	local opt
+	local opt_check
+	opt="$1"
+	opt_check="$2"
+
+	# $opt not enabled, return without running any tests
+	_try_scratch_mount "-o $opt" >/dev/null 2>&1 || return
+	_scratch_unmount
+
+	# option enabled, run the test
+	test_mount_opt $opt $opt_check
+}
+
+# real QA test starts here
+_scratch_mkfs >/dev/null
+
+# options that can't be undo without a umount
+test_should_fail "check_int_print_mask=-123"
+test_optional_opts "check_int" "space_cache,check_int,subvolid"
+test_optional_opts "check_int_data" "space_cache,check_int_data,subvolid"
+test_optional_opts "check_int_print_mask=123" "space_cache,check_int_print_mask=123,subvolid"
+
+test_mount_opt "clear_cache" "relatime,space_cache,clear_cache,subvolid"
+test_mount_opt "degraded" "relatime,degraded,space_cache,subvolid"
+
+test_inverted_opts "acl" "relatime,space_cache,subvolid" "noacl" "relatime,noacl,space_cache,subvolid"
+test_inverted_opts "autodefrag" "relatime,space_cache,autodefrag" "noautodefrag" "relatime,space_cache,subvolid"
+test_inverted_opts "barrier" "relatime,space_cache,subvolid" "nobarrier" "relatime,nobarrier,space_cache,subvolid"
+
+test_should_fail "commit=-10"
+# commit=0 sets the default, so btrfs hides this mount opt
+test_inverted_opts "commit=35" "relatime,space_cache,commit=35,subvolid" "commit=0" "relatime,space_cache,subvolid"
+
+test_should_fail "compress=invalid"
+test_should_fail "compress-force=invalid"
+test_inverted_opts "compress" "relatime,compress=zlib:3,space_cache,subvolid" "compress=lzo" "relatime,compress=lzo,space_cache,subvolid"
+test_inverted_opts "compress=zstd" "relatime,compress=zstd:3,space_cache,subvolid" "compress=no" "relatime,space_cache,subvolid"
+test_inverted_opts "compress-force=no" "relatime,space_cache,subvolid" "compress-force=zstd" "relatime,compress-force=zstd:3,space_cache,subvolid"
+# zlib's max level is 9 and zstd's max level is 15
+test_inverted_opts "compress=zlib:20" "relatime,compress=zlib:9,space_cache,subvolid" "compress=zstd:16" "relatime,compress=zstd:15,space_cache,subvolid"
+test_inverted_opts "compress-force=lzo" "relatime,compress-force=lzo,space_cache,subvolid" "compress-force=zlib:4" "relatime,compress-force=zlib:4,space_cache,subvolid"
+
+# on remount, if we only pass datacow after nodatacow was used it will remain with nodatasum
+test_inverted_opts "nodatacow" "relatime,nodatasum,nodatacow,space_cache,subvolid" "datacow,datasum" "relatime,space_cache,subvolid"
+# nodatacow disabled compression
+test_inverted_opts "compress-force" "relatime,compress-force=zlib:3,space_cache,subvolid" "nodatacow" "relatime,nodatasum,nodatacow,space_cache,subvolid"
+
+# nodatacow disabled both datacow and datasum, and datasum enabled datacow and datasum
+test_inverted_opts "nodatacow" "relatime,nodatasum,nodatacow,space_cache,subvolid" "datasum" "relatime,space_cache,subvolid"
+test_inverted_opts "nodatasum" "relatime,nodatasum,space_cache,subvolid" "datasum" "relatime,space_cache,subvolid"
+
+#TODO: test device= option
+
+test_should_fail "discard=invalid"
+test_inverted_opts "discard" "relatime,discard,space_cache,subvolid" "discard=sync" "relatime,discard,space_cache,subvolid"
+test_inverted_opts "discard=async" "relatime,discard=async,space_cache,subvolid" "discard=sync" "relatime,discard,space_cache,subvolid"
+test_inverted_opts "discard=sync" "relatime,discard,space_cache,subvolid" "nodiscard" "relatime,space_cache,subvolid"
+
+test_inverted_opts "enospc_debug" "relatime,space_cache,enospc_debug,subvolid" "noenospc_debug" "relatime,space_cache,subvolid"
+
+test_should_fail "fatal_errors=pani"
+# fatal_errors=bug is the default
+test_inverted_opts "fatal_errors=panic" "relatime,space_cache,fatal_errors=panic,subvolid" "fatal_errors=bug" "relatime,space_cache,subvolid"
+
+test_inverted_opts "flushoncommit" "relatime,flushoncommit,space_cache,subvolid" "noflushoncommit" "relatime,space_cache,subvolid"
+
+echo "Silence is golden"
+
+status=0
+exit
